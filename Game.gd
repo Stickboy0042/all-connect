@@ -46,6 +46,8 @@ const SFX_VOL := {            # per-sound playback volume in dB
 	"blink": -13.0,
 	"explode": -3.0,
 	"obsidian": -3.0,
+	"spin_left": -9.0,
+	"spin_right": -9.0,
 }
 
 # ── Camera tunables ───────────────────────────────────────────────────────
@@ -777,6 +779,23 @@ func _setup_ui() -> void:
 	layer.add_child(score_label)
 	_update_score_label()
 
+	# Controls hint, pinned to the top-right (stays there as the canvas resizes).
+	var controls := Label.new()
+	controls.text = "CONTROLS\nQ / E  —  Spin grid\nSpace  —  Hard drop"
+	controls.add_theme_font_size_override("font_size", 22)
+	controls.add_theme_color_override("font_color", Color(1.0, 1.0, 1.0, 0.85))
+	controls.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.7))
+	controls.add_theme_constant_override("outline_size", 6)
+	controls.add_theme_constant_override("line_spacing", 4)
+	controls.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	controls.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	controls.grow_horizontal = Control.GROW_DIRECTION_BEGIN
+	controls.offset_left = -24.0
+	controls.offset_right = -24.0
+	controls.offset_top = 16.0
+	controls.offset_bottom = 16.0
+	layer.add_child(controls)
+
 
 func _update_score_label() -> void:
 	if score_label != null:
@@ -819,6 +838,7 @@ func _handle_spin_input() -> void:
 
 func _spin(dir: int) -> void:
 	spinning = true
+	_play("spin_left" if dir > 0 else "spin_right")   # dir +1 = Q (left), -1 = E (right)
 	var quarter := PI / 2.0
 	var target := grid_pivot.rotation.y + dir * quarter
 	var tween := create_tween()
