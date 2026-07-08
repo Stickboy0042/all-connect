@@ -141,6 +141,9 @@ const SHAPES := [
 var cells: Array[Node3D] = []   # the 4 Cell nodes (index matches QUADRANTS/columns)
 var columns: Array = []         # per cell: Dictionary height(int) -> {node, color, group}
 
+var cube_mesh: BoxMesh = null   # one shared box mesh for every cube (size never varies)
+var cam_half_fit := 0.0         # cached world-half-height-per-distance (fov/heading are fixed)
+
 var piece_root: Node3D = null   # container for the active falling piece
 var piece_cubes: Array = []     # entries {node, fx, fz, layer, color}
 var piece_group := -1           # group id of the active piece (-1 for a single cube)
@@ -179,6 +182,9 @@ func _ready() -> void:
 	cam_dir = CAM_DIR.normalized()
 	camera.fov = 62.0
 	camera.current = true
+	cube_mesh = BoxMesh.new()
+	cube_mesh.size = Vector3(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE)
+	cam_half_fit = _world_half_height_per_distance()   # constant during play; compute once
 	_setup_light()
 	_setup_environment()
 	_build_grid()
@@ -292,9 +298,7 @@ func _column_under(world_q: Vector3) -> int:
 
 func _make_cube(type: int) -> MeshInstance3D:
 	var cube := MeshInstance3D.new()
-	var mesh := BoxMesh.new()
-	mesh.size = Vector3(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE)
-	cube.mesh = mesh
+	cube.mesh = cube_mesh   # shared geometry; per-cube look lives in material_override
 	cube.material_override = _make_material(type)
 	return cube
 
@@ -1180,7 +1184,7 @@ func _camera_target() -> Vector2:
 	# Returns (distance, focus_y) needed to keep floor..top framed, or, once
 	# zoomed out to the limit, to keep the top edge pinned at `top`.
 	var top := _spawn_height() + CAM_TOP_MARGIN
-	var half_fit := _world_half_height_per_distance()
+	var half_fit := cam_half_fit
 	var d_fit := (top * 0.5) / half_fit
 	var out: Vector2
 	if d_fit > CAM_MAX_D:
@@ -1339,7 +1343,9 @@ func _setup_pip(layer: CanvasLayer) -> void:
 	pip_viewport.transparent_bg = true
 	pip_viewport.own_world_3d = true
 	pip_viewport.msaa_3d = Viewport.MSAA_4X
-	pip_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	# The preview is static between pieces, so render on demand (in _update_pip) rather
+	# than every frame — this SubViewport was a full extra scene render each frame.
+	pip_viewport.render_target_update_mode = SubViewport.UPDATE_ONCE
 	container.add_child(pip_viewport)
 
 	# One key light from the camera side lights every visible face — no ambient
@@ -1380,6 +1386,7 @@ func _update_pip() -> void:
 		var cube := _make_cube(types[i])
 		cube.position = pts[i] - centroid
 		pip_holder.add_child(cube)
+	pip_viewport.render_target_update_mode = SubViewport.UPDATE_ONCE   # redraw the new piece
 
 
 func _update_score_label() -> void:
