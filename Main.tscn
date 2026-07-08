@@ -1,0 +1,14 @@
+[gd_scene format=3 uid="uid://dfxqt5oudf3x6"]
+
+[ext_resource type="Script" uid="uid://b8xq5p3qs15f3" path="res://Game.gd" id="1_glv2v"]
+
+[node name="Main" type="Node3D" unique_id=785141804]
+script = ExtResource("1_glv2v")
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=268413622]
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=607569227]
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=425698513]
+
+[node name="GridPivot" type="Node3D" parent="." unique_id=395262406]
