@@ -117,6 +117,9 @@ var sfx := {}                   # sound name -> AudioStreamPlayer
 var score := 0
 var blocks_dropped := 0         # total cubes landed (gates obsidian spawns)
 var score_label: Label = null
+var next_piece: Dictionary = {}   # spec for the upcoming piece (shape / types / obsidian)
+var pip_viewport: SubViewport = null
+var pip_holder: Node3D = null      # holds the preview cubes inside the PIP viewport
 
 var spinning := false
 var hard_dropping := false      # true while the active piece is doing a space-bar slam
@@ -275,42 +278,55 @@ func _type_color(type: int) -> Color:
 	return COLORS[type]
 
 
-func _spawn_piece() -> void:
-	var shape: Array
-	var obsidian := false
+func _roll_piece() -> Dictionary:
+	# Decide a piece spec up front (shape + per-cube types) so the NEXT preview can
+	# show exactly what will spawn.
 	var roll := randf()
 	if blocks_dropped >= OBSIDIAN_MIN_BLOCKS and roll < OBSIDIAN_CHANCE:
-		shape = [[0, 0, 0]]     # weighted obsidian is always a single cube
-		piece_group = -1
-		obsidian = true
-	elif roll < OBSIDIAN_CHANCE + MULTI_CHANCE:
-		shape = SHAPES[randi() % SHAPES.size()]
+		return {"shape": [[0, 0, 0]], "types": [OBSIDIAN], "obsidian": true}
+	if roll < OBSIDIAN_CHANCE + MULTI_CHANCE:
+		var shp: Array = SHAPES[randi() % SHAPES.size()]
+		var tps: Array = []
+		for _i in shp.size():
+			tps.append(randi() % COLORS.size())   # multi-cube pieces mix colours
+		return {"shape": shp, "types": tps, "obsidian": false}
+	return {"shape": [[0, 0, 0]], "types": [randi() % COLORS.size()], "obsidian": false}
+
+
+func _spawn_piece() -> void:
+	if next_piece.is_empty():
+		next_piece = _roll_piece()
+	var spec: Dictionary = next_piece
+	var shape: Array = spec["shape"]
+	var types: Array = spec["types"]
+	if not spec["obsidian"] and shape.size() > 1:
 		piece_group = next_group_id
 		next_group_id += 1
 	else:
-		shape = [[0, 0, 0]]     # a plain single cube
 		piece_group = -1
 
 	# All cubes ride a container in world space (they do NOT rotate with the grid
-	# while falling). Footprint x/z map to fixed world quadrants; layer sets y.
+	# while hovering). Footprint x/z map to fixed world quadrants; layer sets y.
 	piece_root = Node3D.new()
 	add_child(piece_root)
 	piece_cubes = []
-	for off in shape:
-		var fx: int = off[0]
-		var fz: int = off[1]
-		var layer: int = off[2]
-		var type := OBSIDIAN if obsidian else randi() % COLORS.size()   # multi-cube pieces mix colours
+	for i in shape.size():
+		var off: Array = shape[i]
+		var type: int = types[i]
 		var cube := _make_cube(type)
-		var wq := _footprint_world(fx, fz)
-		cube.position = Vector3(wq.x, float(layer) * CELL, wq.z)
+		var wq := _footprint_world(off[0], off[1])
+		cube.position = Vector3(wq.x, float(off[2]) * CELL, wq.z)
 		piece_root.add_child(cube)
-		piece_cubes.append({"node": cube, "fx": fx, "fz": fz, "layer": layer, "color": type})
+		piece_cubes.append({"node": cube, "fx": off[0], "fz": off[1], "layer": off[2], "color": type})
 
 	piece_yp = _spawn_height()
 	piece_root.position = Vector3(0.0, piece_yp, 0.0)
 	hard_dropping = false
 	_make_beams()
+
+	# Roll the following piece and refresh its preview.
+	next_piece = _roll_piece()
+	_update_pip()
 
 
 func _footprint_world(fx: int, fz: int) -> Vector3:
@@ -365,19 +381,22 @@ func _update_falling(delta: float) -> void:
 			_spawn_piece()
 		return
 
-	# Space bar slams the current piece straight down to land.
-	if Input.is_action_just_pressed("hard_drop"):
-		hard_dropping = true
-		_play("hard_drop")
+	# The piece HOVERS above the tower until the player commits to a drop with
+	# Space. Until then it just holds position while they spin to aim.
+	if not hard_dropping:
+		if Input.is_action_just_pressed("hard_drop"):
+			hard_dropping = true
+			_play("hard_drop")
+		else:
+			_update_beams()
+			return
 
-	# Rest height is re-evaluated every frame, so spinning the grid changes where
-	# the piece lands. A rigid piece rests on the FIRST support it meets.
+	# Dropping: descend fast until the piece lands on its first support.
 	var rest := _piece_rest_yp()
-	var speed := HARD_DROP_SPEED if hard_dropping else FALL_SPEED
-	var next_yp := piece_yp - speed * delta
+	var next_yp := piece_yp - HARD_DROP_SPEED * delta
 	if next_yp <= rest:
 		if spinning:
-			# Grid is mid-turn: hover until it settles so the piece lands cleanly.
+			# Grid is mid-turn: hover at rest until it settles so it lands cleanly.
 			piece_yp = rest
 		else:
 			_lock_piece(rest)
@@ -781,7 +800,7 @@ func _setup_ui() -> void:
 
 	# Controls hint, pinned to the top-right (stays there as the canvas resizes).
 	var controls := Label.new()
-	controls.text = "CONTROLS\nQ / E  —  Spin grid\nSpace  —  Hard drop"
+	controls.text = "CONTROLS\nQ / E  —  Spin grid\nSpace  —  Drop"
 	controls.add_theme_font_size_override("font_size", 22)
 	controls.add_theme_color_override("font_color", Color(1.0, 1.0, 1.0, 0.85))
 	controls.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.7))
@@ -795,6 +814,79 @@ func _setup_ui() -> void:
 	controls.offset_top = 16.0
 	controls.offset_bottom = 16.0
 	layer.add_child(controls)
+
+	_setup_pip(layer)
+
+
+func _setup_pip(layer: CanvasLayer) -> void:
+	# A small picture-in-picture 3D preview of the next piece (top-left, under the
+	# score). It renders in its own world with the exact in-game cube materials.
+	var bg := ColorRect.new()
+	bg.color = Color(0.03, 0.03, 0.06, 0.45)
+	bg.position = Vector2(16.0, 68.0)
+	bg.size = Vector2(206.0, 196.0)
+	layer.add_child(bg)
+
+	var next_label := Label.new()
+	next_label.text = "NEXT"
+	next_label.add_theme_font_size_override("font_size", 20)
+	next_label.add_theme_color_override("font_color", Color(1.0, 1.0, 1.0, 0.85))
+	next_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.7))
+	next_label.add_theme_constant_override("outline_size", 6)
+	next_label.position = Vector2(24.0, 72.0)
+	layer.add_child(next_label)
+
+	var container := SubViewportContainer.new()
+	container.stretch = false
+	container.position = Vector2(24.0, 104.0)
+	layer.add_child(container)
+
+	pip_viewport = SubViewport.new()
+	pip_viewport.size = Vector2i(190, 150)
+	pip_viewport.transparent_bg = true
+	pip_viewport.own_world_3d = true
+	pip_viewport.msaa_3d = Viewport.MSAA_4X
+	pip_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	container.add_child(pip_viewport)
+
+	# One key light from the camera side lights every visible face — no ambient
+	# needed, which keeps the viewport background transparent.
+	var light := DirectionalLight3D.new()
+	light.light_energy = 1.6
+	pip_viewport.add_child(light)
+	light.look_at_from_position(Vector3(4.0, 8.0, 5.0), Vector3.ZERO, Vector3.UP)
+
+	var cam := Camera3D.new()
+	cam.projection = Camera3D.PROJECTION_ORTHOGONAL
+	cam.size = 4.2
+	cam.position = Vector3(6.0, 6.0, 6.0)
+	cam.current = true
+	pip_viewport.add_child(cam)
+	cam.look_at(Vector3.ZERO, Vector3.UP)
+
+	pip_holder = Node3D.new()
+	pip_viewport.add_child(pip_holder)
+
+
+func _update_pip() -> void:
+	if pip_holder == null or next_piece.is_empty():
+		return
+	for child in pip_holder.get_children():
+		child.queue_free()
+	var shape: Array = next_piece["shape"]
+	var types: Array = next_piece["types"]
+	# Centre the piece on the origin so the fixed camera frames it consistently.
+	var centroid := Vector3.ZERO
+	var pts: Array = []
+	for off in shape:
+		var p := Vector3(0.5 - float(off[0]), float(off[2]), 0.5 - float(off[1]))
+		pts.append(p)
+		centroid += p
+	centroid /= float(shape.size())
+	for i in shape.size():
+		var cube := _make_cube(types[i])
+		cube.position = pts[i] - centroid
+		pip_holder.add_child(cube)
 
 
 func _update_score_label() -> void:
