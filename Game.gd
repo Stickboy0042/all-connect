@@ -68,6 +68,7 @@ const SFX_VOL := {            # per-sound playback volume in dB
 	"spin_left": -9.0,
 	"spin_right": -9.0,
 	"rotate": -8.0,
+	"achievement": -5.0,
 }
 
 # ── Camera tunables ───────────────────────────────────────────────────────
@@ -153,7 +154,13 @@ var next_group_id := 0          # hands out unique ids to multi-cube pieces
 var sfx := {}                   # sound name -> AudioStreamPlayer
 var score := 0
 var blocks_dropped := 0         # total cubes landed (gates obsidian spawns)
+var turn := 0                   # playable pieces locked so far (drives goal deadlines)
+var best_combo := 0             # longest cascade chain reached in a single resolve
+var full_clears := 0            # times the whole board has been wiped
 var score_label: Label = null
+var turn_label: Label = null
+var goals: Array = []           # achievement specs: {text, deadline, check, done, failed}
+var goal_labels: Array = []     # one Label per goal, index-aligned with `goals`
 var next_piece: Dictionary = {}   # spec for the upcoming piece (shape / types / obsidian)
 var intro := false                # true while the opening blocks drop in; blocks player input
 var intro_elapsed := 0.0          # seconds into the opening helix camera move
@@ -191,6 +198,7 @@ func _ready() -> void:
 	_setup_sfx()
 	_setup_music()
 	_setup_cracks()
+	_setup_goals()
 	_setup_ui()
 	# Snap the camera to its framing target so the first frame is right; it lerps to
 	# follow as the opening blocks build the tower.
@@ -564,9 +572,11 @@ func _check_full_clear() -> void:
 	for col in columns:
 		if not col.is_empty():
 			return
+	full_clears += 1
 	_add_score(FULL_CLEAR_POINTS)
 	shake_strength = SHAKE_MAX
 	_play("explode", 1.5)
+	_check_goals()
 
 
 func _footprint_world(fx: int, fz: int) -> Vector3:
@@ -709,6 +719,9 @@ func _lock_piece(rest_yp: float) -> void:
 		_play("land_soft")
 
 	blocks_dropped += piece_cubes.size()
+	turn += 1
+	_update_turn_label()
+	_check_goals()   # a fresh turn can complete a "by turn N" goal or blow its deadline
 
 	piece_root.queue_free()
 	piece_root = null
@@ -871,11 +884,13 @@ func _run_match_chain() -> void:
 	var doomed := _find_matches()
 	while not doomed.is_empty():
 		combo += 1
+		best_combo = maxi(best_combo, combo)
 		await _blink(doomed)
 		await _explode_wave(doomed, combo)   # shatter + crack neighbours + chain react
 		_settle_gravity()
 		await get_tree().create_timer(SETTLE_HOLD).timeout
 		doomed = _find_matches()
+	_check_goals()   # combo/score changes above may have completed a goal
 	_check_full_clear()
 
 
@@ -1295,6 +1310,21 @@ func _setup_ui() -> void:
 	layer.add_child(score_label)
 	_update_score_label()
 
+	# Turn counter, pinned to the top-centre.
+	turn_label = Label.new()
+	turn_label.add_theme_font_size_override("font_size", 28)
+	turn_label.add_theme_color_override("font_color", Color(1.0, 0.92, 0.6))
+	turn_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.7))
+	turn_label.add_theme_constant_override("outline_size", 6)
+	turn_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	turn_label.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	turn_label.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	turn_label.offset_top = 18.0
+	layer.add_child(turn_label)
+	_update_turn_label()
+
+	_setup_goals_ui(layer)
+
 	# Controls hint, pinned to the top-right (stays there as the canvas resizes).
 	var controls := Label.new()
 	controls.text = "CONTROLS\nQ / E  —  Spin grid\nR / F  —  Rotate CW / CCW\nSpace  —  Drop"
@@ -1313,6 +1343,37 @@ func _setup_ui() -> void:
 	layer.add_child(controls)
 
 	_setup_pip(layer)
+
+
+func _setup_goals_ui(layer: CanvasLayer) -> void:
+	# Achievement list, anchored to the bottom-left and grown upward so the header
+	# sits above the goals and the whole block hugs the corner as the window resizes.
+	var box := VBoxContainer.new()
+	box.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
+	box.grow_vertical = Control.GROW_DIRECTION_BEGIN
+	box.grow_horizontal = Control.GROW_DIRECTION_END
+	box.offset_left = 24.0
+	box.offset_bottom = -24.0
+	box.add_theme_constant_override("separation", 6)
+	layer.add_child(box)
+
+	var header := Label.new()
+	header.text = "GOALS"
+	header.add_theme_font_size_override("font_size", 20)
+	header.add_theme_color_override("font_color", Color(1.0, 1.0, 1.0, 0.85))
+	header.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.7))
+	header.add_theme_constant_override("outline_size", 6)
+	box.add_child(header)
+
+	goal_labels = []
+	for i in goals.size():
+		var lbl := Label.new()
+		lbl.add_theme_font_size_override("font_size", 22)
+		lbl.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.7))
+		lbl.add_theme_constant_override("outline_size", 6)
+		box.add_child(lbl)
+		goal_labels.append(lbl)
+		_refresh_goal_label(i)
 
 
 func _setup_pip(layer: CanvasLayer) -> void:
@@ -1394,9 +1455,79 @@ func _update_score_label() -> void:
 		score_label.text = "Score: %d" % score
 
 
+func _update_turn_label() -> void:
+	if turn_label != null:
+		turn_label.text = "Turn %d" % turn
+
+
+func _refresh_goal_label(i: int) -> void:
+	# Pending: "◇ text". Done: "◆ text" in green. Lapsed: "✕ text" dimmed.
+	if i >= goal_labels.size():
+		return
+	var g: Dictionary = goals[i]
+	var lbl: Label = goal_labels[i]
+	if g["done"]:
+		lbl.text = "◆  %s" % g["text"]
+		lbl.add_theme_color_override("font_color", Color(0.55, 1.0, 0.6))
+	elif g["failed"]:
+		lbl.text = "✕  %s" % g["text"]
+		lbl.add_theme_color_override("font_color", Color(0.75, 0.4, 0.4, 0.7))
+	else:
+		lbl.text = "◇  %s" % g["text"]
+		lbl.add_theme_color_override("font_color", Color(1.0, 1.0, 1.0, 0.85))
+
+
 func _add_score(amount: int) -> void:
 	score += amount
 	_update_score_label()
+	_check_goals()
+
+
+# ── Goals / achievements ──────────────────────────────────────────────────
+# A short list of one-shot challenges shown bottom-left. Each has a `check`
+# predicate; some carry a `deadline` turn by which they must be met or they
+# lapse (shown struck through). Completing one pops a chime and a flash.
+
+func _setup_goals() -> void:
+	goals = [
+		{"text": "Score 1000 by turn 10", "deadline": 10, "check": func() -> bool: return score >= 1000},
+		{"text": "Score 3000 by turn 25", "deadline": 25, "check": func() -> bool: return score >= 3000},
+		{"text": "Land 40 blocks", "check": func() -> bool: return blocks_dropped >= 40},
+		{"text": "Chain a 3x combo", "check": func() -> bool: return best_combo >= 3},
+		{"text": "Clear the whole board", "check": func() -> bool: return full_clears >= 1},
+	]
+	for g in goals:
+		g["done"] = false
+		g["failed"] = false
+
+
+func _check_goals() -> void:
+	# Flip any newly-satisfied goal to done (chime + flash), and lapse any whose
+	# turn deadline has passed still unmet. Cheap enough to call on every event.
+	for i in goals.size():
+		var g: Dictionary = goals[i]
+		if g["done"] or g["failed"]:
+			continue
+		if (g["check"] as Callable).call():
+			g["done"] = true
+			_on_goal_completed(i)
+		elif g.has("deadline") and turn > int(g["deadline"]):
+			g["failed"] = true
+			_refresh_goal_label(i)
+
+
+func _on_goal_completed(i: int) -> void:
+	_play("achievement")
+	shake_strength = minf(shake_strength + 0.15, SHAKE_MAX)
+	_refresh_goal_label(i)
+	# A quick white-to-green pop so the eye catches which goal just landed.
+	var lbl: Label = goal_labels[i]
+	lbl.modulate = Color.WHITE
+	lbl.scale = Vector2(1.15, 1.15)
+	lbl.pivot_offset = Vector2(0.0, lbl.size.y * 0.5)
+	var tween := create_tween().set_parallel(true)
+	tween.tween_property(lbl, "modulate", Color(0.55, 1.0, 0.6), 0.35)
+	tween.tween_property(lbl, "scale", Vector2.ONE, 0.35).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 
 
 func _setup_sfx() -> void:
